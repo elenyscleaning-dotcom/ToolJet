@@ -35,6 +35,15 @@ const ORACLE_OPERATORS: Record<string, string> = {
 export default class OracledbQueryService implements QueryService {
   private static _instance: OracledbQueryService;
 
+  // node-oracledb Thick mode is initialised once per process, so the outcome of
+  // initOracleClient() is cached here instead of being recomputed for every
+  // connection. A success is remembered globally (the driver rejects a second
+  // initialisation anyway) and a failure is remembered per client option set, so
+  // a data source configured with different options can still attempt its own
+  // initialisation.
+  private static oracleClientInitialized = false;
+  private static oracleClientInitErrors = new Map<string, Error>();
+
   constructor() {
     if (OracledbQueryService._instance) {
       return OracledbQueryService._instance;
@@ -161,18 +170,31 @@ export default class OracledbQueryService implements QueryService {
   // the system library search path MUST always be
   // set before Node.js is started, for example with ldconfig or LD_LIBRARY_PATH.
   initOracleClient(clientPathType: string, customPath: string,instantClientVersion: string, initOptions: any = {}) {
+    // Thick mode is already enabled for this process, nothing left to do.
+    if (OracledbQueryService.oracleClientInitialized) return;
+
+    const clientOpts: any = { ...initOptions };
+
+    if (clientPathType === 'custom') {
+      clientOpts.libDir = customPath;
+    } else if (clientPathType === 'default') {
+      clientOpts.libDir = `/opt/oracle/instantclient_${instantClientVersion}`;
+    }
+
+    const initCacheKey = `${clientOpts.libDir ?? ''}|${clientOpts.configDir ?? ''}`;
+    const cachedError = OracledbQueryService.oracleClientInitErrors.get(initCacheKey);
+
+    // These options already failed to initialise the client. Replaying the cached
+    // error avoids paying for the same failing initialisation on every connection.
+    if (cachedError) throw cachedError;
+
     try {
-      const clientOpts: any = { ...initOptions };
-
-      if (clientPathType === 'custom') {
-        clientOpts.libDir = customPath;
-      } else if (clientPathType === 'default') {
-        clientOpts.libDir = `/opt/oracle/instantclient_${instantClientVersion}`;
-      }
-
       // enable node-oracledb Thick mode
       oracledb.initOracleClient(clientOpts);
+      OracledbQueryService.oracleClientInitialized = true;
+      OracledbQueryService.oracleClientInitErrors.clear();
     } catch (err) {
+      OracledbQueryService.oracleClientInitErrors.set(initCacheKey, err);
       console.error(err);
       throw err;
     }
@@ -225,7 +247,7 @@ export default class OracledbQueryService implements QueryService {
       } catch (err) {
         console.error('Oracle client failed to initialize', err);
         //SKIP THrowing error since oracle node driver caches the request
-        //TODO Cache the Oracle client initialization result to avoid repeated initialization attempts
+        //initOracleClient() caches its result, so this is not retried for the same options
       }
 
       const connectionConfig: any = {
